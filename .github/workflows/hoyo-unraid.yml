@@ -1,0 +1,84 @@
+name: HoYo Fork - Sync and Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions: {}
+
+concurrency:
+  group: hoyo-fork-publish
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Bot-Code im Fork aktualisieren
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      revision: ${{ steps.sync.outputs.revision }}
+    steps:
+      - name: Eigenen Fork mit Historie laden
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Original abgleichen und Stand speichern
+        id: sync
+        env:
+          UPSTREAM_URL: https://github.com/chiraitori/HoYo_Code_Sender_Discord_Bot.git
+        run: python3 .github/scripts/hoyo_sync_upstream.py
+
+  publish:
+    name: Image aus dem gespeicherten Fork bauen
+    needs: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Genau den abgeglichenen Fork-Stand laden
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.revision }}
+          persist-credentials: false
+
+      - name: Image-Namen bestimmen
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "name=ghcr.io/${OWNER,,}/hoyo-bot" >> "$GITHUB_OUTPUT"
+
+      - name: Docker Buildx vorbereiten
+        uses: docker/setup-buildx-action@v4
+
+      - name: Bei GitHub Container Registry anmelden
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker-Image bauen und veroeffentlichen
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile.unraid
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ needs.sync.outputs.revision }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.sync.outputs.revision }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
