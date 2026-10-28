@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Container version="2">
+  <Name>HoYo-Code-Sender</Name>
+  <Repository>ghcr.io/bomberpilot1/hoyo-bot:latest</Repository>
+  <Registry>https://github.com/users/BomberPilot1/packages/container/package/hoyo-bot</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/issues</Support>
+  <Project>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot</Project>
+  <ReadMe>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/blob/main/UNRAID-APP.md</ReadMe>
+  <Overview>Discord bot that automatically checks for and posts redemption codes for Genshin Impact, Honkai: Star Rail, and Zenless Zone Zero. Original bot by chiraitori; this container and Unraid template are maintained by BomberPilot1.
+
+Requires your own Discord bot application and a reachable MongoDB database. Enter your Discord token, application ID, and MongoDB connection string before starting.
+
+For a local MongoDB container, select the same user-defined Docker network for both containers and use MongoDB's container name and internal port 27017 in MONGODB_URI. MongoDB may also be hosted elsewhere, such as MongoDB Atlas.
+
+After startup, configure the bot in Discord using /setup and /toggleautosend. Configuration and history are stored in MongoDB. This image runs the Discord bot; the separate Next.js dashboard is not started.
+
+This is an independent fan project and is not affiliated with HoYoverse.</Overview>
+  <Category>Network:Other</Category>
+  <Icon>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/icons/hoyo-bot.svg</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/templates/hoyo-bot.xml</TemplateURL>
+  <License>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/blob/main/LICENSE</License>
+  <Requires>Your own Discord bot token and application ID, plus a reachable MongoDB database. The image is built for linux/amd64.</Requires>
+  <Config Name="Discord bot token" Target="DISCORD_TOKEN" Default="" Mode="" Description="Bot token from the Discord Developer Portal. Keep this value private." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Discord application ID" Target="CLIENT_ID" Default="" Mode="" Description="Application ID from General Information in the Discord Developer Portal. It must belong to the same application as DISCORD_TOKEN." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="MongoDB connection URI" Target="MONGODB_URI" Default="" Mode="" Description="Your MongoDB connection string, including database name and credentials. For containers on the same user-defined network, use the MongoDB container name and its internal port 27017. Example: mongodb://USER:PASSWORD@mongodb:27017/hoyo?authSource=admin" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Discord owner user ID (optional)" Target="OWNER_ID" Default="" Mode="" Description="Your Discord user ID for owner-specific commands. Enable Developer Mode in Discord to copy your user ID." Type="Variable" Display="always" Required="false" Mask="false"/>
+</Container>
