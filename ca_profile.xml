@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <CommunityApplications>
   <Profile>Unraid templates and container builds maintained by BomberPilot1. This repository packages chiraitori's HoYo Code Sender Discord Bot for self-hosting on Unraid. Support for this container and template is available through this repository's GitHub Issues.</Profile>
-  <Icon>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/icons/hoyo-bot.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/icons/hoyo-bot-character.png</Icon>
   <WebPage>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot</WebPage>
 </CommunityApplications>
