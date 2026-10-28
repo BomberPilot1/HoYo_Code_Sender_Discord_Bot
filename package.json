@@ -25,7 +25,7 @@
     "nodemon": "^3.1.14"
   },
   "overrides": {
-    "undici": "6.29.0"
+    "undici": "6.29.1"
   },
   "engines": {
     "node": ">=16.9.0"
