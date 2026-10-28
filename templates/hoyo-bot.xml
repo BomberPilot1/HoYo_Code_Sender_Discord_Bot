@@ -18,14 +18,20 @@ For a local MongoDB container, select the same user-defined Docker network for b
 
 After startup, configure the bot in Discord using /setup and /toggleautosend. Configuration and history are stored in MongoDB. This image runs the Discord bot; the separate Next.js dashboard is not started.
 
+Livestream tracking can be enabled or disabled in the template. An optional YouTube Data API key improves YouTube live/upcoming status and schedule detection. The web/API port defaults to host port 3000 and container port 3000; change the host port if it is already in use. The WebUI link opens the bot's built-in web server, not the separate Next.js dashboard.
+
 This is an independent fan project and is not affiliated with HoYoverse.</Overview>
   <Category>Network:Other</Category>
-  <Icon>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/icons/hoyo-bot.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/icons/hoyo-bot-character.png</Icon>
   <TemplateURL>https://raw.githubusercontent.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/main/templates/hoyo-bot.xml</TemplateURL>
+  <WebUI>http://[IP]:[PORT:3000]/</WebUI>
   <License>https://github.com/BomberPilot1/HoYo_Code_Sender_Discord_Bot/blob/main/LICENSE</License>
   <Requires>Your own Discord bot token and application ID, plus a reachable MongoDB database. The image is built for linux/amd64.</Requires>
   <Config Name="Discord bot token" Target="DISCORD_TOKEN" Default="" Mode="" Description="Bot token from the Discord Developer Portal. Keep this value private." Type="Variable" Display="always" Required="true" Mask="true"/>
   <Config Name="Discord application ID" Target="CLIENT_ID" Default="" Mode="" Description="Application ID from General Information in the Discord Developer Portal. It must belong to the same application as DISCORD_TOKEN." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Livestream tracking" Target="LIVESTREAM_TRACKING_ENABLED" Default="true|false" Mode="" Description="Enable livestream and HoYoLAB post tracking. Choose true to enable or false to disable." Type="Variable" Display="always" Required="false" Mask="false">true</Config>
   <Config Name="MongoDB connection URI" Target="MONGODB_URI" Default="" Mode="" Description="Your MongoDB connection string, including database name and credentials. For containers on the same user-defined network, use the MongoDB container name and its internal port 27017. Example: mongodb://USER:PASSWORD@mongodb:27017/hoyo?authSource=admin" Type="Variable" Display="always" Required="true" Mask="true"/>
   <Config Name="Discord owner user ID (optional)" Target="OWNER_ID" Default="" Mode="" Description="Your Discord user ID for owner-specific commands. Enable Developer Mode in Discord to copy your user ID." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="YouTube API key (optional)" Target="YOUTUBE_API_KEY" Default="" Mode="" Description="Optional YouTube Data API key for improved livestream status and schedule detection. Keep this value private." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Web / API port" Target="3000" Default="3000" Mode="tcp" Description="Host port for the bot's built-in web/API server. Change the host port if 3000 is already in use. This is not the separate Next.js dashboard." Type="Port" Display="always" Required="false" Mask="false">3000</Config>
 </Container>

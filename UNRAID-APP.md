@@ -28,6 +28,12 @@ The original bot is developed by [chiraitori](https://github.com/chiraitori/HoYo
 | `CLIENT_ID` | Yes | Application ID of the same Discord application. |
 | `MONGODB_URI` | Yes | MongoDB connection string including database name and authentication. |
 | `OWNER_ID` | No | Your Discord user ID for owner-specific commands. |
+| `LIVESTREAM_TRACKING_ENABLED` | No | `true` by default. Choose `false` to disable livestream and HoYoLAB post tracking. |
+| `YOUTUBE_API_KEY` | No | Your YouTube Data API key for improved YouTube live/upcoming status and schedule detection. |
+
+The template also maps TCP host port `3000` to container port `3000` for the bot's built-in web/API server. If host port `3000` is already used, change the host-side value while keeping container port `3000`.
+
+Discord tokens, MongoDB connection strings and YouTube API keys are masked in the template's input fields and have no personal values prefilled. Each user enters their own credentials during installation.
 
 Example connection string for MongoDB on the same user-defined Docker network:
 
@@ -45,7 +51,7 @@ For external MongoDB deployments, use their provided connection string, configur
 
 Bot configuration and notification history are stored in MongoDB. Back up your database and keep its data on persistent storage.
 
-The template does not require a local appdata mapping for the bot, nor any published ports. It starts the Discord bot process. The separate Next.js dashboard from the original project is not started by this image.
+The template does not require a local appdata mapping for the bot. It starts the Discord bot process and publishes its built-in web/API server on host port `3000` by default. The Unraid WebUI menu entry opens that server. The Discord bot itself does not require an incoming port; remove the port mapping if you do not need web/API access. The separate Next.js dashboard from the original project is not started by this image.
 
 Warnings about missing optional `TOPGG_TOKEN`, `WEBHOOK_PASSWORD`, or `VERSION` do not by themselves prevent the bot from starting. Do not use the original developer's credentials.
 
@@ -63,4 +69,6 @@ Original project: [chiraitori/HoYo_Code_Sender_Discord_Bot](https://github.com/c
 
 ## License
 
-The bot remains under the project's existing [GPL license](LICENSE). Keep the original license and attribution. This fork's Unraid template, metadata, documentation and new SVG icon use the same repository license.
+The bot remains under the project's existing [GPL license](LICENSE). Keep the original license and attribution. This fork's Unraid template, metadata and documentation use the same repository license.
+
+The character icon is adapted from a user-provided game screenshot. The depicted game character and original artwork belong to their respective rights holders.
