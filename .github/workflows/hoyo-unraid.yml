@@ -36,7 +36,7 @@ jobs:
         run: python3 .github/scripts/hoyo_sync_upstream.py
 
   publish:
-    name: Build the image from the saved fork
+    name: Publish the image when files have changed
     needs: sync
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -48,6 +48,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.sync.outputs.revision }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Determine the image name
@@ -66,7 +67,74 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compare files with the last published image
+        id: changes
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          SOURCE_URL: https://github.com/${{ github.repository }}
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def finish(build, reason):
+              with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
+                  output.write(f"build={str(build).lower()}\n")
+              with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as summary:
+                  summary.write(f"## Docker image\n\n{reason}\n")
+              print(reason)
+
+          def main():
+              inspected = subprocess.run(
+                  ['docker', 'buildx', 'imagetools', 'inspect',
+                   os.environ['IMAGE'] + ':latest', '--format', '{{json .Image}}'],
+                  capture_output=True, text=True, check=False,
+              )
+              if inspected.returncode:
+                  error = inspected.stderr.strip()
+                  if 'not found' in error.lower() or 'manifest unknown' in error.lower():
+                      finish(True, 'No latest image exists yet. Building the first image.')
+                      return
+                  # Registry/network errors must not cause unnecessary publications.
+                  raise RuntimeError(f'Could not inspect the published image: {error}')
+
+              image = json.loads(inspected.stdout)
+              image = image.get('linux/amd64', image)
+              labels = image.get('config', {}).get('Labels') or {}
+              previous = labels.get('org.opencontainers.image.revision', '')
+              if (labels.get('org.opencontainers.image.source') != os.environ['SOURCE_URL']
+                      or not re.fullmatch(r'[0-9a-f]{40,64}', previous)):
+                  finish(True, 'The latest image has no matching fork revision. Building once.')
+                  return
+
+              known = subprocess.run(
+                  ['git', 'cat-file', '-e', previous + '^{commit}'],
+                  capture_output=True, text=True, check=False,
+              )
+              if known.returncode:
+                  finish(True, 'The published revision is absent from the fork history. Building once.')
+                  return
+
+              # .github is excluded by Dockerfile.unraid.dockerignore. A workflow-only
+              # change or an empty merge must not create a new container version.
+              changed = subprocess.run(
+                  ['git', 'diff', '--quiet', previous, 'HEAD', '--', '.', ':(exclude).github'],
+                  check=False,
+              )
+              if changed.returncode not in (0, 1):
+                  raise RuntimeError('Could not compare the fork with the published revision.')
+              if changed.returncode == 0:
+                  finish(False, 'No file changes since the last published image. Build and push skipped.')
+              else:
+                  finish(True, 'Files differ from the last published image. Building and publishing.')
+
+          main()
+
       - name: Build and publish the Docker image
+        if: steps.changes.outputs.build == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
