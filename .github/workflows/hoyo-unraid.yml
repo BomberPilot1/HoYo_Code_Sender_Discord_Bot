@@ -1,11 +1,10 @@
 name: HoYo Fork - Sync and Docker
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '0 4 * * *'
+      timezone: Europe/Berlin
 
 permissions: {}
 
@@ -95,7 +94,10 @@ jobs:
               )
               if inspected.returncode:
                   error = inspected.stderr.strip()
-                  if 'not found' in error.lower() or 'manifest unknown' in error.lower():
+                  missing_manifest = re.search(
+                      r'(?i)(?:manifest unknown|name unknown|:latest: not found(?:\s|$))', error
+                  )
+                  if missing_manifest:
                       finish(True, 'No latest image exists yet. Building the first image.')
                       return
                   # Registry/network errors must not cause unnecessary publications.
@@ -106,17 +108,21 @@ jobs:
               labels = image.get('config', {}).get('Labels') or {}
               previous = labels.get('org.opencontainers.image.revision', '')
               if (labels.get('org.opencontainers.image.source') != os.environ['SOURCE_URL']
-                      or not re.fullmatch(r'[0-9a-f]{40,64}', previous)):
-                  finish(True, 'The latest image has no matching fork revision. Building once.')
-                  return
+                      or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', previous)):
+                  raise RuntimeError(
+                      'The latest image has no valid revision for this fork. '
+                      'Cannot prove a source change; no image will be built or published.'
+                  )
 
               known = subprocess.run(
                   ['git', 'cat-file', '-e', previous + '^{commit}'],
                   capture_output=True, text=True, check=False,
               )
               if known.returncode:
-                  finish(True, 'The published revision is absent from the fork history. Building once.')
-                  return
+                  raise RuntimeError(
+                      'The published revision is absent from the fork history. '
+                      'Cannot prove a source change; no image will be built or published.'
+                  )
 
               # .github is excluded by Dockerfile.unraid.dockerignore. A workflow-only
               # change or an empty merge must not create a new container version.
