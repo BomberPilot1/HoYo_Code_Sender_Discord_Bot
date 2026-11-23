@@ -3,7 +3,8 @@ const assert = require('node:assert');
 
 const {
   getValidatedLanguage, getValidatedConfigPatch,
-  getValidatedSettingsPatch, configPatchBelongsToGuild
+  getValidatedSettingsPatch, configPatchBelongsToGuild,
+  getValidatedTestPayload, getValidatedPostCodePayload
 } = require('../utils/dashboardInput');
 
 test('returns internal literals for supported dashboard languages', () => {
@@ -48,4 +49,66 @@ test('rejects unsupported and non-string language input', () => {
   assert.strictEqual(getValidatedLanguage('$where'), null);
   assert.strictEqual(getValidatedLanguage({ $ne: null }), null);
   assert.strictEqual(getValidatedLanguage(undefined), null);
+});
+
+test('validates forumThreads snowflakes and guild ownership', () => {
+  assert.deepStrictEqual(
+    getValidatedConfigPatch({ forumThreads: { genshin: '123456789012345678', hsr: '', zzz: null } }),
+    { forumThreads: { genshin: '123456789012345678', hsr: null, zzz: null } }
+  );
+  assert.strictEqual(getValidatedConfigPatch({ forumThreads: 'bad' }), null);
+  assert.strictEqual(getValidatedConfigPatch({ forumThreads: { zzz: 'not-a-snowflake' } }), null);
+
+  const guild = {
+    roles: [],
+    channels: [],
+    threads: [{ id: '123456789012345678' }]
+  };
+  assert.strictEqual(
+    configPatchBelongsToGuild({ forumThreads: { genshin: '123456789012345678', zzz: null } }, guild),
+    true
+  );
+  assert.strictEqual(
+    configPatchBelongsToGuild({ forumThreads: { genshin: '999999999999999999' } }, guild),
+    false
+  );
+});
+
+test('validates optional test game payload', () => {
+  assert.deepStrictEqual(getValidatedTestPayload(undefined), { game: null });
+  assert.deepStrictEqual(getValidatedTestPayload({}), { game: null });
+  assert.deepStrictEqual(getValidatedTestPayload({ game: 'zzz' }), { game: 'zzz' });
+  assert.strictEqual(getValidatedTestPayload({ game: 'invalid' }), null);
+  assert.strictEqual(getValidatedTestPayload([]), null);
+});
+
+test('validates manual post-code payload constraints and sanitization', () => {
+  assert.deepStrictEqual(
+    getValidatedPostCodePayload({
+      game: 'hsr',
+      codes: [' starrailgift ', 'STARRAILGIFT', 'omega'],
+      message: '  Claim before expiry  ',
+      mentionRole: false,
+      target: 'thread'
+    }),
+    {
+      game: 'hsr',
+      codes: ['STARRAILGIFT', 'OMEGA'],
+      message: 'Claim before expiry',
+      mentionRole: false,
+      target: 'thread'
+    }
+  );
+  for (const invalid of [
+    null,
+    { game: 'hi3', codes: ['ABC'] },
+    { game: 'zzz', codes: [] },
+    { game: 'zzz', codes: ['A', 'B', 'C', 'D'] },
+    { game: 'zzz', codes: ['bad space!'] },
+    { game: 'zzz', codes: ['ZENLESSGIFT'], mentionRole: 'yes' },
+    { game: 'zzz', codes: ['ZENLESSGIFT'], target: 'dm' },
+    { game: 'zzz', codes: ['ZENLESSGIFT'], message: 'x'.repeat(501) }
+  ]) {
+    assert.strictEqual(getValidatedPostCodePayload(invalid), null);
+  }
 });
