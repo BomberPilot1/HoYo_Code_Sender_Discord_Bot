@@ -30,6 +30,7 @@ jobs:
       run: npm install
 
     - name: Install dashboard dependencies
+      if: hashFiles('dashboard/package.json') != ''
       run: npm ci --prefix dashboard
     
     - name: Run npm audit
@@ -41,8 +42,13 @@ jobs:
       continue-on-error: true
 
     - name: Run dashboard production audit
+      if: hashFiles('dashboard/package.json') != ''
       run: npm audit --prefix dashboard --omit=dev --json > dashboard-audit-results.json
       continue-on-error: true
+
+    - name: Explain separate dashboard checks
+      if: hashFiles('dashboard/package.json') == ''
+      run: echo "The dashboard is a separate repository/submodule. Its own CI runs its security checks."
     
     - name: Upload audit results
       uses: actions/upload-artifact@v7
@@ -55,7 +61,11 @@ jobs:
     
     - name: Check for high/critical vulnerabilities
       run: |
-        for REPORT in audit-results.json dashboard-audit-results.json; do
+        REPORTS=(audit-results.json)
+        if [ -f dashboard/package.json ]; then
+          REPORTS+=(dashboard-audit-results.json)
+        fi
+        for REPORT in "${REPORTS[@]}"; do
           jq -e '.metadata.vulnerabilities | (.high | type == "number") and (.critical | type == "number")' "$REPORT" > /dev/null
           HIGH_VULNS=$(jq '.metadata.vulnerabilities.high' "$REPORT")
           CRITICAL_VULNS=$(jq '.metadata.vulnerabilities.critical' "$REPORT")
