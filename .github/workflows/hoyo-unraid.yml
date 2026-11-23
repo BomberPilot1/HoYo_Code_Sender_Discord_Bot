@@ -126,8 +126,20 @@ jobs:
 
               # .github is excluded by Dockerfile.unraid.dockerignore. A workflow-only
               # change or an empty merge must not create a new container version.
+              paths = ['.', ':(exclude).github']
+              def dashboard_is_submodule(revision):
+                  listing = subprocess.run(
+                      ['git', 'ls-tree', '-z', revision, '--', 'dashboard'],
+                      capture_output=True, text=True, check=True,
+                  )
+                  return listing.stdout.startswith('160000 commit ')
+              # Checkout does not initialize submodules. Updating only the separate
+              # dashboard's pointer therefore does not change the bot image inputs.
+              # The initial directory-to-submodule migration still counts as a change.
+              if dashboard_is_submodule(previous) and dashboard_is_submodule('HEAD'):
+                  paths.append(':(exclude)dashboard')
               changed = subprocess.run(
-                  ['git', 'diff', '--quiet', previous, 'HEAD', '--', '.', ':(exclude).github'],
+                  ['git', 'diff', '--quiet', previous, 'HEAD', '--', *paths],
                   check=False,
               )
               if changed.returncode not in (0, 1):
