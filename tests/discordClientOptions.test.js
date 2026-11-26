@@ -20,14 +20,24 @@ test('subscribes only to guild events required by slash commands', () => {
     assert.equal(options.intents.includes(GatewayIntentBits.GuildMessages), false);
 });
 
-test('does not retain messages, reactions, presence, or voice state', () => {
+test('does not retain messages, reactions, presence, voice state, or unused guild managers', () => {
     for (const managerName of [
+        'ApplicationCommandManager',
+        'AutoModerationRuleManager',
+        'BaseGuildEmojiManager',
+        'DMMessageManager',
+        'GuildBanManager',
+        'GuildEmojiManager',
+        'GuildInviteManager',
+        'GuildScheduledEventManager',
+        'GuildStickerManager',
         'MessageManager',
+        'PresenceManager',
         'ReactionManager',
         'ReactionUserManager',
-        'PresenceManager',
-        'VoiceStateManager',
-        'ThreadMemberManager'
+        'StageInstanceManager',
+        'ThreadMemberManager',
+        'VoiceStateManager'
     ]) {
         assert.equal(createCache(managerName).maxSize, 0, managerName);
     }
@@ -52,4 +62,9 @@ test('bounds member, user, and thread caches while retaining the bot identity', 
 test('keeps short fallback sweepers for fetched messages and archived threads', () => {
     assert.deepEqual(sweepers.messages, { interval: 300, lifetime: 300 });
     assert.deepEqual(sweepers.threads, { interval: 900, lifetime: 3600 });
+});
+
+test('enables Discord enforceNonce deduplication on the client', () => {
+    const options = createDiscordClientOptions();
+    assert.equal(options.enforceNonce, true);
 });

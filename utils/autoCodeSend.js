@@ -6,7 +6,7 @@ const Language = require('../models/Language');
 const languageManager = require('./language');
 const { enrichCodesWithHoyolabRewards } = require('./codeRewardEnricher');
 const { sendChannelMessage } = require('./discordMessageSender');
-const { getKnownGuildIds } = require('./clusterGuilds');
+const { getKnownGuildIds, broadcastEvalWhenReady } = require('./clusterGuilds');
 const { getHoyolabExchangeCodes, mergeExchangeCodes } = require('./hoyolabExchangeCodes');
 const { shouldSendGameNotifications } = require('./notificationPreferences');
 const { getRoleMention } = require('./roleMention');
@@ -40,8 +40,31 @@ const settingsMapping = {
 };
 
 const CURRENT_DELIVERY_VERSION = 2;
+const DELIVERY_BATCH_SIZE = 40;
+const DEFINITE_UNSENT_DISCORD_CODES = new Set([10003, 10008, 50001, 50013, 50035, 50083]);
 
 let codeCheckRunning = false;
+let embedBuildCounter = 0;
+const DISCORD_EMBED_DESCRIPTION_LIMIT = 4096;
+
+function normalizeCodeKey(game, code) {
+    return `${game}:${String(code || '').trim().toUpperCase()}`;
+}
+
+function normalizeId(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+function isDefiniteUnsentError(error) {
+    if (!error) {
+        return false;
+    }
+    if (DEFINITE_UNSENT_DISCORD_CODES.has(Number(error.code))) {
+        return true;
+    }
+    const status = Number(error.status);
+    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
 
 // Concurrency limiter - processes promises in batches
 async function processInBatches(tasks, batchSize) {
@@ -63,7 +86,7 @@ function getCodesToNotify(
     return gameCodes
         .filter(codeData => codeData.status === 'OK')
         .filter(codeData => {
-            const key = `${codeData.game}:${codeData.code}`;
+            const key = normalizeCodeKey(codeData.game, codeData.code);
             if (existingCodesMap.has(key) || selectedKeys.has(key)) {
                 return false;
             }
@@ -76,6 +99,7 @@ async function insertCodeIfMissing(codeData, botId, CodeModel = Code) {
     try {
         await CodeModel.create({
             ...codeData,
+            code: String(codeData.code || '').trim().toUpperCase(),
             timestamp: new Date(),
             notifiedBots: [],
             notifiedTargets: [],
@@ -100,13 +124,14 @@ function getCodeDeliveryTargets(config, settings, game, botId) {
     const roleId = config[roleMapping[game]];
     const sendToChannel = settings?.autoSendOptions?.channel !== false;
     const sendToThreads = settings?.autoSendOptions?.threads !== false;
+    const channelId = normalizeId(config.channel);
 
-    if (sendToChannel && config.channel) {
+    if (sendToChannel && channelId) {
         targets.push({
-            id: `${botId}:channel:${config.channel}`,
+            id: `${botId}:channel:${channelId}`,
             legacyId: getCodeNotificationTargetId(botId, config.guildId),
             guildId: config.guildId,
-            channelId: config.channel,
+            channelId,
             type: 'channel',
             roleId,
             config
@@ -118,8 +143,8 @@ function getCodeDeliveryTargets(config, settings, game, botId) {
         hkrpg: config.forumThreads?.hsr,
         nap: config.forumThreads?.zzz
     };
-    const threadId = threadMapping[game];
-    if (sendToThreads && threadId && threadId !== config.channel) {
+    const threadId = normalizeId(threadMapping[game]);
+    if (sendToThreads && threadId && threadId !== channelId) {
         targets.push({
             id: `${botId}:thread:${threadId}`,
             legacyId: getCodeNotificationTargetId(botId, config.guildId),
@@ -136,22 +161,24 @@ function getCodeDeliveryTargets(config, settings, game, botId) {
 
 function getPendingCodesForTarget(codes, existingCodesMap, targetId, legacyTargetId = null) {
     return codes.filter(codeData => {
-        const existing = existingCodesMap.get(`${codeData.game}:${codeData.code}`);
+        const existing = existingCodesMap.get(normalizeCodeKey(codeData.game, codeData.code));
         const notifiedTargets = existing?.notifiedTargets || [];
         return !notifiedTargets.includes(targetId)
             && (!legacyTargetId || !notifiedTargets.includes(legacyTargetId));
     });
 }
 
-async function claimCodeNotifications(game, codes, targetId) {
+async function claimCodeNotifications(game, codes, targetId, legacyTargetId = null) {
     const claimedCodes = [];
+    const guardedTargetIds = legacyTargetId ? [targetId, legacyTargetId] : [targetId];
 
     for (const codeData of codes) {
+        const normalizedCode = String(codeData.code || '').trim().toUpperCase();
         const claimed = await Code.findOneAndUpdate(
             {
                 game,
-                code: codeData.code,
-                notifiedTargets: { $ne: targetId }
+                code: normalizedCode,
+                notifiedTargets: { $nin: guardedTargetIds }
             },
             { $addToSet: { notifiedTargets: targetId } },
             { new: true }
@@ -170,9 +197,80 @@ async function releaseCodeNotificationClaims(game, codes, targetId) {
     }
 
     await Code.updateMany(
-        { game, code: { $in: codes.map(code => code.code) } },
+        {
+            game,
+            code: { $in: codes.map(code => String(code.code || '').trim().toUpperCase()) }
+        },
         { $pull: { notifiedTargets: targetId } }
     );
+}
+
+function inspectShardChannelPermissions(shardClient, context) {
+    const unwritable = [];
+
+    for (const item of context.channels || []) {
+        const guild = shardClient.guilds.cache.get(item.guildId) || null;
+        const channel = shardClient.channels.cache.get(item.channelId)
+            || guild?.channels?.cache?.get(item.channelId)
+            || null;
+        if (!channel) {
+            // Discord always caches standard guild text/announcement channels for connected guilds.
+            // If this shard owns the guild and the channel ID is missing, it was deleted (10003).
+            if (guild && item.type === 'channel') {
+                unwritable.push({ channelId: item.channelId, reason: 'missing_channel' });
+            }
+            continue;
+        }
+
+        if (!channel.isTextBased?.() || typeof channel.send !== 'function') {
+            unwritable.push({ channelId: item.channelId, reason: 'not_sendable' });
+            continue;
+        }
+
+        const resolvedGuild = guild || channel.guild || null;
+        const botMember = resolvedGuild?.members?.me
+            || resolvedGuild?.members?.cache?.get(shardClient.user?.id)
+            || null;
+        const permissions = botMember ? channel.permissionsFor(botMember) : null;
+        const sendPermission = item.type === 'thread' ? 'SendMessagesInThreads' : 'SendMessages';
+
+        if (permissions && !permissions.has(['ViewChannel', sendPermission, 'EmbedLinks'])) {
+            unwritable.push({ channelId: item.channelId, reason: 'missing_permissions' });
+        }
+    }
+
+    return unwritable;
+}
+
+async function findUnwritableCachedChannels(client, tasks) {
+    if (!client?.shard?.broadcastEval || tasks.length === 0) {
+        return new Map();
+    }
+
+    const uniqueChannels = new Map();
+    for (const task of tasks) {
+        if (!uniqueChannels.has(task.target.channelId)) {
+            uniqueChannels.set(task.target.channelId, {
+                channelId: task.target.channelId,
+                guildId: task.target.guildId,
+                type: task.target.type
+            });
+        }
+    }
+
+    try {
+        const shardResults = await broadcastEvalWhenReady(
+            client,
+            inspectShardChannelPermissions,
+            { context: { channels: [...uniqueChannels.values()] } }
+        );
+        return new Map(
+            shardResults.flat().map(entry => [entry.channelId, entry.reason])
+        );
+    } catch (error) {
+        console.warn('[Code Check] Could not pre-check shard channel permissions:', error.message);
+        return new Map();
+    }
 }
 
 async function checkAndSendNewCodes(client) {
@@ -185,59 +283,17 @@ async function checkAndSendNewCodes(client) {
     console.log('Starting code check process...');
     const startTime = Date.now();
     const games = ['genshin', 'hkrpg', 'nap'];
-    
+
     try {
-        // Fetch all configurations, settings, and languages in parallel once
-        const [rawConfigs, rawSettings, languages] = await Promise.all([
-            Config.find({}).sort({ _id: 1 }).lean(),
-            Settings.find({}).sort({ _id: 1 }).lean(),
-            Language.find({}).lean()
-        ]);
-        const configs = getLatestGuildRecords(rawConfigs);
-        const allSettings = getLatestGuildRecords(rawSettings);
-        const duplicateConfigs = countDuplicateGuildRecords(rawConfigs);
-        const duplicateSettings = countDuplicateGuildRecords(rawSettings);
-        if (duplicateConfigs || duplicateSettings) {
-            console.warn(
-                `[Code Check] Ignoring duplicate DB rows: ${duplicateConfigs} config, `
-                + `${duplicateSettings} settings (newest row per guild wins)`
-            );
-        }
-
-        // Create lookup maps to avoid repeated database queries
-        const settingsMap = allSettings.reduce((map, setting) => {
-            map[setting.guildId] = setting;
-            return map;
-        }, {});
-        
-        const languageMap = languages.reduce((map, lang) => {
-            map[lang.guildId] = lang;
-            return map;
-        }, {});
-
-        // Pre-populate language cache from batch-fetched data to avoid per-guild DB queries
-        for (const lang of languages) {
-            languageManager.languageCache.set(lang.guildId, {
-                language: lang.language,
-                timestamp: Date.now()
-            });
-        }
-
         const botId = client.user?.id;
         if (!botId) {
             throw new Error('Cannot check codes before the bot is ready');
         }
 
-        // Batch fetch all existing codes
-        const allExistingCodes = await Code.find({}).lean();
-        const existingCodesMap = new Map(
-            allExistingCodes.map(code => [`${code.game}:${code.code}`, code])
-        );
-        const knownGuildIds = await getKnownGuildIds(client);
-        console.log(`Code check: ${allExistingCodes.length} existing codes in DB, ${knownGuildIds.size} known guilds`);
-
-        // Fetch all games' codes in parallel
-        const gameCodeRequests = games.map(game => 
+        // Fast-path: fetch lightweight existing code metadata AND external APIs in parallel first.
+        // Only query Config/Settings/Language (~8,500+ docs) and cross-shard guild lists when
+        // new codes are actually discovered (avoids ~23s of wasted DB reads on idle 5-min ticks).
+        const gameCodeRequests = games.map(game =>
             axios.get(`https://hoyo-codes.seria.moe/codes?game=${game}`, {
                 timeout: 15000, // 15 second timeout
                 headers: {
@@ -250,7 +306,13 @@ async function checkAndSendNewCodes(client) {
                 })
         );
 
-        const gameResponses = await Promise.all(gameCodeRequests);
+        const [allExistingCodes, gameResponses] = await Promise.all([
+            Code.find({}, { game: 1, code: 1, isExpired: 1 }).lean(),
+            Promise.all(gameCodeRequests)
+        ]);
+        const existingCodesMap = new Map(
+            allExistingCodes.map(code => [normalizeCodeKey(code.game, code.code), code])
+        );
 
         await Promise.all(gameResponses.map(async (response, index) => {
             const game = games[index];
@@ -277,23 +339,23 @@ async function checkAndSendNewCodes(client) {
         // Process all games' responses
         gameResponses.forEach((response, index) => {
             const game = games[index];
-            
+
             // A partial source can still provide new codes, but is not authoritative
             // enough to expire codes that are absent from its response.
             if (!response.expirationSafe) {
                 failedGames.add(game);
                 console.log(`Skipping expiration check for ${game} because the primary API was unavailable or invalid`);
             }
-            
+
             const gameCodes = response.data?.codes || [];
-            
+
             // Track all active codes from API for expiration checking (only for successful requests)
             gameCodes.forEach(codeData => {
                 if (codeData.status === 'OK') {
-                    activeCodesFromAPI.add(`${codeData.game}:${codeData.code}`);
+                    activeCodesFromAPI.add(normalizeCodeKey(codeData.game, codeData.code));
                 }
             });
-            
+
             if (gameCodes.length) {
                 const activeCodes = gameCodes.filter(codeData => codeData.status === 'OK');
                 const newCodes = getCodesToNotify(
@@ -307,11 +369,11 @@ async function checkAndSendNewCodes(client) {
                 }
 
                 activeCodes
-                    .filter(codeData => !existingCodesMap.has(`${codeData.game}:${codeData.code}`))
+                    .filter(codeData => !existingCodesMap.has(normalizeCodeKey(codeData.game, codeData.code)))
                     .forEach(codeData => {
                         codesToSave.push({
                             game: codeData.game,
-                            code: codeData.code,
+                            code: String(codeData.code || '').trim().toUpperCase(),
                             isExpired: false
                         });
                     });
@@ -320,22 +382,22 @@ async function checkAndSendNewCodes(client) {
 
         // Find codes that are no longer in API (expired)
         // Only check expiration for games where API request was successful
-        const expiredCodes = allExistingCodes.filter(code => 
+        const expiredCodes = allExistingCodes.filter(code =>
             !code.isExpired && // Only check codes that aren't already marked as expired
             !failedGames.has(code.game) && // Skip games with failed API requests
-            !activeCodesFromAPI.has(`${code.game}:${code.code}`) // Code not found in API response
+            !activeCodesFromAPI.has(normalizeCodeKey(code.game, code.code)) // Code not found in API response
         );
 
         // Find codes that were marked as expired but are now active again in API
-        const reactivatedCodes = allExistingCodes.filter(code => 
+        const reactivatedCodes = allExistingCodes.filter(code =>
             code.isExpired && // Only check codes that are currently marked as expired
             !failedGames.has(code.game) && // Skip games with failed API requests
-            activeCodesFromAPI.has(`${code.game}:${code.code}`) // Code found active in API response
+            activeCodesFromAPI.has(normalizeCodeKey(code.game, code.code)) // Code found active in API response
         );
 
         // Batch operations
         const operations = [];
-        
+
         let insertedCodes = [];
 
         // Save first. Only the process that wins the unique DB insert may notify.
@@ -347,11 +409,11 @@ async function checkAndSendNewCodes(client) {
         }
 
         const insertedCodeKeys = new Set(
-            insertedCodes.map(code => `${code.game}:${code.code}`)
+            insertedCodes.map(code => normalizeCodeKey(code.game, code.code))
         );
         for (const game of Object.keys(newCodesForGames)) {
             newCodesForGames[game] = newCodesForGames[game].filter(
-                code => insertedCodeKeys.has(`${code.game}:${code.code}`)
+                code => insertedCodeKeys.has(normalizeCodeKey(code.game, code.code))
             );
             if (newCodesForGames[game].length === 0) {
                 delete newCodesForGames[game];
@@ -367,7 +429,7 @@ async function checkAndSendNewCodes(client) {
                     { $set: { isExpired: true } }
                 )
             );
-            console.log(`Marking ${expiredCodes.length} codes as expired:`, 
+            console.log(`Marking ${expiredCodes.length} codes as expired:`,
                 expiredCodes.map(c => `${c.game}:${c.code}`));
         } else {
             console.log('No codes to mark as expired');
@@ -382,7 +444,7 @@ async function checkAndSendNewCodes(client) {
                     { $set: { isExpired: false } }
                 )
             );
-            console.log(`Reactivating ${reactivatedCodes.length} codes (marking as active):`, 
+            console.log(`Reactivating ${reactivatedCodes.length} codes (marking as active):`,
                 reactivatedCodes.map(c => `${c.game}:${c.code}`));
         } else {
             console.log('No codes to reactivate');
@@ -400,10 +462,61 @@ async function checkAndSendNewCodes(client) {
         }
 
         // ===== OPTIMIZED MESSAGE SENDING =====
-        // If no new codes, skip all message sending logic
+        // If no new codes, exit immediately without loading Config/Settings/Language or polling shards
         if (Object.keys(newCodesForGames).length === 0) {
-            console.log(`Code check completed in ${Date.now() - startTime}ms. No new codes found.`);
+            console.log(`Code check completed in ${Date.now() - startTime}ms (${allExistingCodes.length} existing codes). No new codes found.`);
             return;
+        }
+
+        // Load guild configurations, settings, languages, and connected guild IDs ONLY when broadcasting new codes
+        const [rawConfigs, rawSettings, languages, knownGuildIds] = await Promise.all([
+            Config.find({}, {
+                guildId: 1,
+                channel: 1,
+                forumThreads: 1,
+                genshinRole: 1,
+                hsrRole: 1,
+                zzzRole: 1,
+                notifications: 1
+            }).sort({ _id: 1 }).lean(),
+            Settings.find({}, {
+                guildId: 1,
+                autoSendEnabled: 1,
+                autoSendOptions: 1,
+                favoriteGames: 1
+            }).sort({ _id: 1 }).lean(),
+            Language.find({}, { guildId: 1, language: 1 }).lean(),
+            getKnownGuildIds(client)
+        ]);
+        const configs = getLatestGuildRecords(rawConfigs);
+        const allSettings = getLatestGuildRecords(rawSettings);
+        const duplicateConfigs = countDuplicateGuildRecords(rawConfigs);
+        const duplicateSettings = countDuplicateGuildRecords(rawSettings);
+        if (duplicateConfigs || duplicateSettings) {
+            console.warn(
+                `[Code Check] Ignoring duplicate DB rows: ${duplicateConfigs} config, `
+                + `${duplicateSettings} settings (newest row per guild wins)`
+            );
+        }
+        console.log(`Code check: ${insertedCodes.length} new code(s), ${configs.length} configured / ${knownGuildIds.size} known guilds`);
+
+        // Create lookup maps to avoid repeated database queries
+        const settingsMap = allSettings.reduce((map, setting) => {
+            map[setting.guildId] = setting;
+            return map;
+        }, {});
+
+        const languageMap = languages.reduce((map, lang) => {
+            map[lang.guildId] = lang;
+            return map;
+        }, {});
+
+        // Pre-populate language cache from batch-fetched data to avoid per-guild DB queries
+        for (const lang of languages) {
+            languageManager.languageCache.set(lang.guildId, {
+                language: lang.language,
+                timestamp: Date.now()
+            });
         }
 
         // Pre-build embeds per (game, language) to avoid rebuilding identical embeds for 2500+ guilds
@@ -414,7 +527,7 @@ async function checkAndSendNewCodes(client) {
 
         // Build embed cache: key = `${game}:${lang}` → { embed, supportMsg }
         const embedCache = new Map();
-        
+
         const embedBuildPromises = [];
         for (const game of Object.keys(newCodesForGames)) {
             for (const lang of uniqueLanguages) {
@@ -430,14 +543,22 @@ async function checkAndSendNewCodes(client) {
 
         console.log(`Pre-built ${embedCache.size} embed(s) for ${Object.keys(newCodesForGames).length} game(s) × ${uniqueLanguages.size} language(s)`);
 
+        // Only reconcile configs that are currently missing a role ID on the hot send path
+        // (full reconciliation already runs on startup).
         for (const game of Object.keys(newCodesForGames)) {
-            const eligibleConfigs = configs.filter(config => {
+            const roleField = roleMapping[game];
+            const missingRoleConfigs = configs.filter(config => {
+                if (config[roleField]) {
+                    return false;
+                }
                 const settings = settingsMap[config.guildId];
                 return knownGuildIds.has(config.guildId)
                     && shouldSendGameNotifications(settings, game)
                     && getCodeDeliveryTargets(config, settings, game, botId).length > 0;
             });
-            await reconcileConfiguredRoles(client, eligibleConfigs, game);
+            if (missingRoleConfigs.length > 0) {
+                await reconcileConfiguredRoles(client, missingRoleConfigs, game);
+            }
         }
 
         // Prepare message sending tasks as lazy functions (not yet executing)
@@ -448,12 +569,12 @@ async function checkAndSendNewCodes(client) {
         for (const config of configs) {
             const guildId = config.guildId;
             const settings = settingsMap[guildId];
-            
+
             if (!knownGuildIds.has(guildId)) {
                 skippedNotInGuild++;
                 continue;
             }
-            
+
             // Process each game with new codes
             for (const game in newCodesForGames) {
                 if (!shouldSendGameNotifications(settings, game)) {
@@ -481,57 +602,76 @@ async function checkAndSendNewCodes(client) {
                     messageTasks.set(`${game}:${target.id}`, {
                         game,
                         codes: pendingCodes,
+                        target,
                         targetId: target.id,
-                        run: async () => {
-                            const claimedCodes = await claimCodeNotifications(
-                                game,
-                                pendingCodes,
-                                target.id
-                            );
-                            if (claimedCodes.length === 0) {
-                                return false;
-                            }
-
-                            try {
-                                const claimedEmbed = claimedCodes.length === pendingCodes.length
-                                    ? cachedEmbed
-                                    : await buildEmbedForGameAndLang(
-                                        game,
-                                        guildLangCode,
-                                        claimedCodes
-                                    );
-                                const sent = await sendCodeNotificationTarget(
-                                    client,
-                                    target,
-                                    game,
-                                    claimedCodes,
-                                    claimedEmbed
-                                );
-                                if (!sent) {
-                                    await releaseCodeNotificationClaims(
-                                        game,
-                                        claimedCodes,
-                                        target.id
-                                    );
-                                }
-                                return sent;
-                            } catch (error) {
-                                await releaseCodeNotificationClaims(
-                                    game,
-                                    claimedCodes,
-                                    target.id
-                                );
-                                throw error;
-                            }
-                        }
+                        guildLangCode,
+                        cachedEmbed
                     });
                 }
             }
         }
 
-        // Execute message sends in batches of 50 for rate-limit safety at 2500+ guilds
-        // Discord global rate limit is 50 requests/second, so batches of 50 with natural async gaps work well
-        const queuedTasks = [...messageTasks.values()];
+        const rawQueuedTasks = [...messageTasks.values()];
+        const unwritableChannels = await findUnwritableCachedChannels(client, rawQueuedTasks);
+
+        const queuedTasks = rawQueuedTasks.map(task => ({
+            ...task,
+            run: async () => {
+                const unwritableReason = unwritableChannels.get(task.target.channelId);
+                if (unwritableReason) {
+                    console.warn(
+                        `[sendNotif] Skip ${task.target.guildId}/${task.target.channelId} `
+                        + `(${task.target.type}): ${unwritableReason}`
+                    );
+                    return false;
+                }
+
+                const claimedCodes = await claimCodeNotifications(
+                    task.game,
+                    task.codes,
+                    task.target.id,
+                    task.target.legacyId
+                );
+                if (claimedCodes.length === 0) {
+                    return false;
+                }
+
+                try {
+                    const claimedEmbed = claimedCodes.length === task.codes.length
+                        ? task.cachedEmbed
+                        : await buildEmbedForGameAndLang(
+                            task.game,
+                            task.guildLangCode,
+                            claimedCodes
+                        );
+                    const delivery = await sendCodeNotificationTarget(
+                        client,
+                        task.target,
+                        task.game,
+                        claimedCodes,
+                        claimedEmbed
+                    );
+                    if (!delivery.sent && delivery.definiteUnsent) {
+                        await releaseCodeNotificationClaims(
+                            task.game,
+                            claimedCodes,
+                            task.target.id
+                        );
+                    }
+                    return delivery.sent;
+                } catch (error) {
+                    if (isDefiniteUnsentError(error)) {
+                        await releaseCodeNotificationClaims(
+                            task.game,
+                            claimedCodes,
+                            task.target.id
+                        );
+                    }
+                    throw error;
+                }
+            }
+        }));
+
         const matchingConfiguredGuilds = configs.length - skippedNotInGuild;
         if (configs.length > 0 && matchingConfiguredGuilds === 0) {
             console.error(
@@ -542,8 +682,8 @@ async function checkAndSendNewCodes(client) {
         }
         console.log(`Task summary: ${queuedTasks.length} to send, ${skippedNotInGuild} guilds not found, ${skippedAutoSendOff} auto-send disabled`);
         if (queuedTasks.length > 0) {
-            console.log(`Sending notifications to ${queuedTasks.length} channel/thread target(s) in batches of 50...`);
-            const results = await processInBatches(queuedTasks, 50);
+            console.log(`Sending notifications to ${queuedTasks.length} channel/thread target(s) in batches of ${DELIVERY_BATCH_SIZE}...`);
+            const results = await processInBatches(queuedTasks, DELIVERY_BATCH_SIZE);
             const successCount = results.filter(
                 result => result.status === 'fulfilled' && result.value === true
             ).length;
@@ -561,8 +701,9 @@ async function checkAndSendNewCodes(client) {
 
 // Pre-build embed content for a specific game + language combination
 async function buildEmbedForGameAndLang(game, lang, codes) {
-    // Temporarily set a fake guildId in language cache so getString uses this language
-    const fakeGuildId = `__embed_build_${lang}`;
+    // Use a unique synthetic guildId per call so concurrent builds for the same
+    // language never delete each other's temporary languageCache entry.
+    const fakeGuildId = `__embed_build_${game}_${lang}_${++embedBuildCounter}`;
     languageManager.languageCache.set(fakeGuildId, {
         language: lang,
         timestamp: Date.now()
@@ -582,15 +723,18 @@ async function buildEmbedForGameAndLang(game, lang, codes) {
         );
 
         const descriptionPromises = codes.map(async code => {
-            const rewardString = code.rewards ? 
-                await languageManager.getRewardString(code.rewards, fakeGuildId) : 
+            const rewardString = code.rewards ?
+                await languageManager.getRewardString(code.rewards, fakeGuildId) :
                 await languageManager.getString('commands.listcodes.noReward', fakeGuildId);
-            
-            return `**${code.code}**\n[${redeemText}](${redeemUrls[game]}?code=${code.code})\n└ ${rewardString}`;
+
+            return `**${code.code}**\n[${redeemText}](${redeemUrls[game]}?code=${encodeURIComponent(code.code)})\n└ ${rewardString}`;
         });
 
         const descriptions = await Promise.all(descriptionPromises);
-        const finalDescription = descriptions.join('\n\n');
+        let finalDescription = descriptions.join('\n\n');
+        if (finalDescription.length > DISCORD_EMBED_DESCRIPTION_LIMIT) {
+            finalDescription = `${finalDescription.slice(0, DISCORD_EMBED_DESCRIPTION_LIMIT - 3)}...`;
+        }
 
         const supportMsg = await languageManager.getSupportFooter(fakeGuildId);
 
@@ -612,7 +756,7 @@ async function sendCodeNotificationTarget(client, target, game, codes, cachedEmb
     const { guildId, channelId, type, roleId, config } = target;
     if (!guildId || !codes?.length) {
         console.log(`[sendNotif] Skip ${guildId}: missing guildId or codes`);
-        return false;
+        return { sent: false, definiteUnsent: true };
     }
 
     try {
@@ -624,7 +768,7 @@ async function sendCodeNotificationTarget(client, target, game, codes, cachedEmb
         if (channel) {
             if (!channel.isTextBased?.() || typeof channel.send !== 'function') {
                 console.warn(`[sendNotif] ${guildId}/${channelId} is not a sendable text channel`);
-                return false;
+                return { sent: false, definiteUnsent: true };
             }
 
             const permissions = botMember ? channel.permissionsFor(botMember) : null;
@@ -637,17 +781,26 @@ async function sendCodeNotificationTarget(client, target, game, codes, cachedEmb
                 PermissionFlagsBits.EmbedLinks
             ])) {
                 console.warn(`[sendNotif] Missing permissions for ${guildId}/${channelId} (${type})`);
-                return false;
+                return { sent: false, definiteUnsent: true };
             }
         }
 
         const roleMention = getRoleMention(roleId);
+        const dedupeKey = `code:${game}:${channelId}:${codes
+            .map(code => String(code.code || '').trim().toUpperCase())
+            .sort()
+            .join(',')}`;
+
         await sendChannelMessage(client, channelId, {
             content: roleMention.content,
             embeds: [cachedEmbed.embed],
             allowedMentions: roleMention.allowedMentions
+        }, {
+            preferRest: true,
+            guildId,
+            dedupeKey
         });
-        return true;
+        return { sent: true, definiteUnsent: false };
 
     } catch (error) {
         console.error(
@@ -662,7 +815,7 @@ async function sendCodeNotificationTarget(client, target, game, codes, cachedEmb
             if (guild) {
                 await notifyGuildOwnerMissingPermissions(client, guild, config, 'SendMessages');
             }
-            return false;
+            return { sent: false, definiteUnsent: true };
         }
 
         if (error.code === 10003) {
@@ -671,11 +824,11 @@ async function sendCodeNotificationTarget(client, target, game, codes, cachedEmb
             if (guild) {
                 await notifyGuildOwnerMissingChannel(client, guild, config);
             }
-            return false;
+            return { sent: false, definiteUnsent: true };
         }
 
-        // For other errors, fail silently
-        return false;
+        // Only treat unambiguous 4xx rejections as definitely unsent; timeouts/5xx may have succeeded.
+        return { sent: false, definiteUnsent: isDefiniteUnsentError(error) };
     }
 }
 
@@ -704,16 +857,22 @@ async function notifyGuildOwnerMissingChannel(client, guild, config) {
 
         await owner.send({ embeds: [embed] });
 
-        // Mark as notified to prevent future spam
-        await Config.updateOne(
-            { guildId: guild.id },
-            { 
-                $set: { 
-                    'notifications.channelMissing.notified': true,
-                    'notifications.channelMissing.lastNotified': new Date()
-                }
+        // Mark as notified on the active config document to prevent future spam
+        const updatePayload = {
+            $set: {
+                'notifications.channelMissing.notified': true,
+                'notifications.channelMissing.lastNotified': new Date()
             }
-        );
+        };
+        if (config._id) {
+            await Config.updateOne({ _id: config._id }, updatePayload);
+        } else {
+            await Config.findOneAndUpdate(
+                { guildId: guild.id },
+                updatePayload,
+                { sort: { _id: -1 } }
+            );
+        }
     } catch (error) {
         // Silently handle DM errors (user might have DMs disabled)
     }
@@ -723,7 +882,7 @@ async function notifyGuildOwnerMissingChannel(client, guild, config) {
 async function notifyGuildOwnerMissingPermissions(client, guild, config, permission) {
     try {
         // Check if we've already notified about this specific permission issue
-        if (config.notifications?.permissionMissing?.notified && 
+        if (config.notifications?.permissionMissing?.notified &&
             config.notifications?.permissionMissing?.permission === permission) {
             return; // Already notified about this permission, don't spam
         }
@@ -746,17 +905,23 @@ async function notifyGuildOwnerMissingPermissions(client, guild, config, permiss
 
         await owner.send({ embeds: [embed] });
 
-        // Mark as notified to prevent future spam
-        await Config.updateOne(
-            { guildId: guild.id },
-            { 
-                $set: { 
-                    'notifications.permissionMissing.notified': true,
-                    'notifications.permissionMissing.lastNotified': new Date(),
-                    'notifications.permissionMissing.permission': permission
-                }
+        // Mark as notified on the active config document to prevent future spam
+        const updatePayload = {
+            $set: {
+                'notifications.permissionMissing.notified': true,
+                'notifications.permissionMissing.lastNotified': new Date(),
+                'notifications.permissionMissing.permission': permission
             }
-        );
+        };
+        if (config._id) {
+            await Config.updateOne({ _id: config._id }, updatePayload);
+        } else {
+            await Config.findOneAndUpdate(
+                { guildId: guild.id },
+                updatePayload,
+                { sort: { _id: -1 } }
+            );
+        }
     } catch (error) {
         // Silently handle DM errors (user might have DMs disabled)
     }
@@ -764,9 +929,12 @@ async function notifyGuildOwnerMissingPermissions(client, guild, config, permiss
 
 module.exports = {
     checkAndSendNewCodes,
+    buildEmbedForGameAndLang,
     getCodesToNotify,
     insertCodeIfMissing,
     getCodeNotificationTargetId,
     getPendingCodesForTarget,
-    getCodeDeliveryTargets
+    getCodeDeliveryTargets,
+    inspectShardChannelPermissions,
+    isDefiniteUnsentError
 };

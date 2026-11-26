@@ -2,12 +2,22 @@ const { GatewayIntentBits, Options } = require('discord.js');
 
 const cacheLimits = {
     ...Options.DefaultMakeCacheSettings,
+    ApplicationCommandManager: 0,
+    AutoModerationRuleManager: 0,
+    BaseGuildEmojiManager: 0,
+    DMMessageManager: 0,
+    GuildBanManager: 0,
+    GuildEmojiManager: 0,
+    GuildInviteManager: 0,
+    GuildScheduledEventManager: 0,
+    GuildStickerManager: 0,
     MessageManager: 0,
+    PresenceManager: 0,
     ReactionManager: 0,
     ReactionUserManager: 0,
-    PresenceManager: 0,
-    VoiceStateManager: 0,
+    StageInstanceManager: 0,
     ThreadMemberManager: 0,
+    VoiceStateManager: 0,
     ThreadManager: 25,
     GuildMemberManager: {
         maxSize: 25,
@@ -36,6 +46,7 @@ function createDiscordClientOptions() {
         // Slash commands and outbound messages only need guild events. Listening
         // for every guild message filled per-channel caches without any consumer.
         intents: [GatewayIntentBits.Guilds],
+        enforceNonce: true,
         makeCache: Options.cacheWithLimits(cacheLimits),
         sweepers
     };
